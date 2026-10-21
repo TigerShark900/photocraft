@@ -11,7 +11,7 @@
 //! channel and the selection, and scales effects, vectors and guides with them, in one history
 //! step.
 
-use photocraft_algo::pixel_art::{PixelArtScale, upscale_surface_in_canvas};
+use photocraft_algo::pixel_art::{PixelArtScale, peak_bytes, upscale_surface_in_canvas};
 use photocraft_geom::Rect;
 use serde_json::{Value, json};
 
@@ -48,6 +48,18 @@ fn enabled(s: &Session) -> std::result::Result<(), String> {
     s.active().map(|_| ()).ok_or_else(|| "no document open".into())
 }
 
+/// Refuses, before anything is allocated, an upscale whose working memory would pass the resample
+/// budget: the result alone may fit it while Scale4x's 2x intermediate and the band buffers don't.
+fn check_peak(scale: PixelArtScale, ow: u32, oh: u32, bytes_per_pixel: usize, channels: usize) -> Result<()> {
+    let peak = peak_bytes(scale, ow, oh, bytes_per_pixel, channels);
+    let max = crate::image_cmds::MAX_RESAMPLE_BYTES;
+    if peak <= max {
+        return Ok(());
+    }
+    let n = scale.factor();
+    Err(bad(format!("upscaling {ow} x {oh} px {n}x needs about {} MB of working memory; the limit is {} MB. Choose a smaller scale", peak >> 20, max >> 20)))
+}
+
 fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let scale = parse_scale(p)?;
     let n = scale.factor();
@@ -59,6 +71,8 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let (nw, nh) = (nw as u32, nh as u32);
     crate::image_cmds::check_resample_budget(ID, &d.doc, nw, nh, "")?;
+    let f = d.doc.pixel_format();
+    check_peak(scale, ow, oh, f.bytes_per_pixel(), f.channels())?;
     let k = f64::from(n);
     s.set_sampler_map(photocraft_geom::Affine { m: [k, 0.0, 0.0, k, 0.0, 0.0] });
     s.edit("Pixel Art Upscale", |doc, _| {
@@ -202,6 +216,20 @@ mod tests {
         let e = s.execute(ID, json!({"scale": "scale3x"})).unwrap_err().to_string();
         assert!(e.contains("300000"), "{e}");
         assert_eq!(doc(&s).size, Size::new(100_001, 1));
+    }
+
+    /// The result alone fits the budget, but not with Scale4x's 2x intermediate beside it.
+    #[test]
+    fn scale4x_counts_its_intermediate_against_the_budget() {
+        let max = crate::image_cmds::MAX_RESAMPLE_BYTES;
+        // 32-bit RGBA: 16 bytes a pixel. A square whose 4x result is just under the budget.
+        let side = ((max / 16) as f64).sqrt() as u32 / 4 - 1;
+        assert!(u64::from(side * 4).pow(2) * 16 <= max, "the result alone fits");
+        let e = check_peak(PixelArtScale::Scale4x, side, side, 16, 4).unwrap_err().to_string();
+        assert!(e.contains("working memory"), "{e}");
+        // Scale2x of the same source is a quarter of the size: well within.
+        assert!(check_peak(PixelArtScale::Scale2x, side, side, 16, 4).is_ok());
+        assert!(check_peak(PixelArtScale::Scale4x, u32::MAX, u32::MAX, 16, 5).is_err());
     }
 
     /// A layer parked near the edge of the coordinate range can't be scaled past it.

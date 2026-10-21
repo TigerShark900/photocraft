@@ -53,6 +53,29 @@ pub fn upscale_surface_in_canvas(s: &Surface, scale: PixelArtScale, canvas: Rect
     }
 }
 
+/// The most memory [`upscale_surface_in_canvas`] holds at once for a `w` x `h` source of
+/// `bytes_per_pixel` and `channels`, beyond the source itself: the result, Scale4x's 2x
+/// intermediate (alive while the second pass writes the result), and one pass's `f32` band
+/// buffers. Saturates instead of overflowing.
+pub fn peak_bytes(scale: PixelArtScale, w: u32, h: u32, bytes_per_pixel: usize, channels: usize) -> u64 {
+    let n = u64::from(scale.factor());
+    let px = |k: u64| u64::from(w).saturating_mul(k).saturating_mul(u64::from(h).saturating_mul(k));
+    let surfaces = match scale {
+        PixelArtScale::Scale4x => px(4).saturating_add(px(2)),
+        _ => px(n),
+    }
+    .saturating_mul(bytes_per_pixel as u64);
+    // One band reads a row of the widest pass (with its margin) and writes its rows, never less
+    // than one source row and otherwise capped at READ_BUDGET samples.
+    let (src_w, pn) = match scale {
+        PixelArtScale::Scale4x => (u64::from(w).saturating_mul(2), 2),
+        _ => (u64::from(w), n),
+    };
+    let row = src_w.saturating_add(2).saturating_add(src_w.saturating_mul(pn * pn)).saturating_mul(channels.max(1) as u64);
+    let band = row.max(READ_BUDGET as u64).saturating_mul(std::mem::size_of::<f32>() as u64);
+    surfaces.saturating_add(band)
+}
+
 /// `r` scaled by `n` about the origin, saturating at the `i32` range.
 pub fn scale_rect(r: Rect, n: u32) -> Rect {
     let n = n as i32;
@@ -276,6 +299,19 @@ mod tests {
         let out = upscale_surface_in_canvas(&lone, PixelArtScale::Scale2x, Rect::new(0, 0, 4, 4));
         assert_eq!(out.content_bounds(), Rect::new(-6, -6, -4, -4));
         assert_eq!(out.read_region(Rect::new(-6, -6, -4, -4)).chunks(4).filter(|p| *p == R).count(), 4);
+    }
+
+    #[test]
+    fn peak_bytes_counts_the_result_the_scale4x_intermediate_and_the_bands() {
+        let band = READ_BUDGET as u64 * 4;
+        assert_eq!(peak_bytes(PixelArtScale::Scale2x, 10, 10, 4, 4), 400 * 4 + band);
+        assert_eq!(peak_bytes(PixelArtScale::Scale3x, 10, 10, 4, 4), 900 * 4 + band);
+        // Scale4x keeps the 2x image (a quarter of the result) while it writes the result.
+        assert_eq!(peak_bytes(PixelArtScale::Scale4x, 10, 10, 4, 4), (1600 + 400) * 4 + band);
+        // A row wider than the budget is still read whole.
+        let wide = 1 << 22;
+        assert_eq!(peak_bytes(PixelArtScale::Scale2x, wide, 1, 1, 1) - 4 * u64::from(wide), (u64::from(wide) * 5 + 2) * 4);
+        assert_eq!(peak_bytes(PixelArtScale::Scale4x, u32::MAX, u32::MAX, 16, 5), u64::MAX);
     }
 
     #[test]
