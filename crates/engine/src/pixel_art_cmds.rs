@@ -1,0 +1,220 @@
+//! Image › Pixel Art Upscale (`image.pixelArtUpscale`): enlarges the whole document 2, 3 or 4
+//! times with Scale2x / Scale3x (`photocraft_algo::pixel_art`), the upscalers made for sprites
+//! and low-resolution art. Nearest Neighbor keeps the hard edges but leaves every diagonal a
+//! coarse staircase; the interpolating methods smooth the diagonals but blur the edges and invent
+//! in-between colours. Scale2x/3x do neither: they only copy existing neighbours, so the palette
+//! stays exact (an Indexed Color document keeps its colour table) while diagonals step at the new
+//! resolution.
+//!
+//! Photoshop has no such resample (emulators and pixel-art editors do), so the id is our own; the
+//! menu item sits in Image after Image Size. Like Image Size it resizes every layer, mask,
+//! channel and the selection, and scales effects, vectors and guides with them, in one history
+//! step.
+
+use photocraft_algo::pixel_art::{PixelArtScale, upscale_surface_in_canvas};
+use photocraft_geom::Rect;
+use serde_json::{Value, json};
+
+use crate::commands::CommandSpec;
+use crate::{EngineError, Result, Session};
+
+/// The command id.
+pub const ID: &str = "image.pixelArtUpscale";
+
+/// The largest side Image Size allows.
+const MAX_SIDE: u64 = 300_000;
+
+fn bad(msg: impl Into<String>) -> EngineError {
+    EngineError::BadParams { cmd: ID.into(), msg: msg.into() }
+}
+
+fn parse_scale(p: &Value) -> Result<PixelArtScale> {
+    if !p.is_object() {
+        return Err(bad("params must be a JSON object"));
+    }
+    match p.get("scale") {
+        None => Ok(PixelArtScale::Scale2x),
+        Some(Value::String(s)) => match s.as_str() {
+            "scale2x" => Ok(PixelArtScale::Scale2x),
+            "scale3x" => Ok(PixelArtScale::Scale3x),
+            "scale4x" => Ok(PixelArtScale::Scale4x),
+            other => Err(bad(format!("`scale` must be \"scale2x\", \"scale3x\" or \"scale4x\", not {other:?}"))),
+        },
+        Some(_) => Err(bad("`scale` must be \"scale2x\", \"scale3x\" or \"scale4x\"")),
+    }
+}
+
+fn enabled(s: &Session) -> std::result::Result<(), String> {
+    s.active().map(|_| ()).ok_or_else(|| "no document open".into())
+}
+
+fn run(s: &mut Session, p: &Value) -> Result<Value> {
+    let scale = parse_scale(p)?;
+    let n = scale.factor();
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let (ow, oh) = (d.doc.size.width, d.doc.size.height);
+    let (nw, nh) = (u64::from(ow) * u64::from(n), u64::from(oh) * u64::from(n));
+    if nw > MAX_SIDE || nh > MAX_SIDE {
+        return Err(bad(format!("{ow} x {oh} px upscaled {n}x is {nw} x {nh} px; a side can be at most {MAX_SIDE} px")));
+    }
+    let (nw, nh) = (nw as u32, nh as u32);
+    crate::image_cmds::check_resample_budget(ID, &d.doc, nw, nh, "")?;
+    let k = f64::from(n);
+    s.set_sampler_map(photocraft_geom::Affine { m: [k, 0.0, 0.0, k, 0.0, 0.0] });
+    s.edit("Pixel Art Upscale", |doc, _| {
+        // Layers may reach far past the canvas; refuse before changing anything when some pixels
+        // would leave the 32-bit coordinate range (the surfaces saturate there).
+        let fits = |r: Rect| r.is_empty() || [r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.checked_mul(n as i32).is_some());
+        let mut ok = true;
+        crate::image_cmds::for_each_surface(&mut doc.layers, true, &mut |surf, _| ok = ok && fits(surf.content_bounds()));
+        ok = ok
+            && doc.channels.iter().chain(doc.quick_mask.as_ref()).all(|ch| fits(ch.surface.content_bounds()))
+            && doc.selection.as_ref().is_none_or(|sel| fits(sel.content_bounds()));
+        if !ok {
+            return Err(bad(format!("upscaling {n}x would push some pixels outside the 32-bit coordinate range")));
+        }
+        let canvas = Rect::from_xywh(0, 0, ow, oh);
+        // Masks, channels and the selection take the same rule, so they keep fitting the pixels.
+        crate::image_cmds::rescale_doc(doc, nw, nh, &mut |surf, _| upscale_surface_in_canvas(surf, scale, canvas));
+        Ok(())
+    })?;
+    Ok(json!({ "width": nw, "height": nh }))
+}
+
+/// The command spec.
+pub fn specs() -> Vec<CommandSpec> {
+    vec![CommandSpec {
+        id: ID,
+        label: "Pixel Art Upscale…",
+        menu: &["Image"],
+        shortcut: None,
+        params: r#"{"scale":"scale2x|scale3x|scale4x"="scale2x"} → {"width","height"}"#,
+        enabled,
+        run,
+        journal: true,
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use photocraft_doc::{Document, Size};
+
+    fn doc(s: &Session) -> &Document {
+        &s.active().unwrap().doc
+    }
+
+    /// A 3 × 3 document: a red staircase over a blue sky, on the Background.
+    fn stairs(depth: u32) -> Session {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 3, "height": 3, "depth": depth})).unwrap();
+        s.execute("edit.fill", json!({"color": "#0000ff"})).unwrap();
+        for (x, y, w) in [(0, 0, 1), (0, 1, 2), (0, 2, 3)] {
+            s.execute("select.rect", json!({"x": x, "y": y, "width": w, "height": 1})).unwrap();
+            s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+        }
+        s.execute("select.deselect", json!({})).unwrap();
+        s
+    }
+
+    fn rgb(s: &Session, x: i32, y: i32) -> [f32; 3] {
+        let p = doc(s).layers[0].surface().unwrap().rgba(x, y);
+        [p[0], p[1], p[2]]
+    }
+
+    const RED: [f32; 3] = [1.0, 0.0, 0.0];
+    const BLUE: [f32; 3] = [0.0, 0.0, 1.0];
+
+    #[test]
+    fn upscales_the_document_and_rounds_diagonals_at_every_depth() {
+        for depth in [8, 16, 32] {
+            for (scale, n) in [("scale2x", 2), ("scale3x", 3), ("scale4x", 4)] {
+                let mut s = stairs(depth);
+                let r = s.execute(ID, json!({"scale": scale})).unwrap();
+                assert_eq!(r, json!({"width": 3 * n, "height": 3 * n}), "{depth} {scale}");
+                assert_eq!(doc(&s).size, Size::new(3 * n, 3 * n));
+                // The middle pixel's top-right corner turns to sky; its opposite corner stays red.
+                let (x0, y0) = (n as i32, n as i32);
+                assert_eq!(rgb(&s, x0 + n as i32 - 1, y0), BLUE, "{depth} {scale}");
+                assert_eq!(rgb(&s, x0, y0 + n as i32 - 1), RED, "{depth} {scale}");
+                // Every pixel is one of the two colours: nothing in between.
+                for y in 0..3 * n as i32 {
+                    for x in 0..3 * n as i32 {
+                        let p = rgb(&s, x, y);
+                        assert!(p == RED || p == BLUE, "{depth} {scale} ({x}, {y}) {p:?}");
+                    }
+                }
+                assert!(s.undo());
+                assert_eq!(doc(&s).size, Size::new(3, 3));
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_to_scale2x() {
+        let mut s = stairs(8);
+        s.execute(ID, json!({})).unwrap();
+        assert_eq!(doc(&s).size, Size::new(6, 6));
+    }
+
+    /// The colour table holds only the source colours, and the result keeps to them.
+    #[test]
+    fn indexed_color_keeps_its_colour_table() {
+        let mut s = stairs(8);
+        s.execute("image.mode.indexedColor", json!({})).unwrap();
+        s.execute(ID, json!({"scale": "scale3x"})).unwrap();
+        let surf = doc(&s).layers[0].surface().unwrap();
+        for y in 0..9 {
+            for x in 0..9 {
+                let p = surf.pixel(x, y);
+                assert!(p[..3] == RED || p[..3] == BLUE, "({x}, {y}) {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn selection_and_masks_follow_the_pixels() {
+        let mut s = stairs(8);
+        s.execute("layer.new.layer", json!({})).unwrap();
+        s.execute("select.rect", json!({"x": 1, "y": 1, "width": 1, "height": 2})).unwrap();
+        s.execute("layer.layerMask.revealSelection", json!({})).unwrap();
+        s.execute("select.rect", json!({"x": 1, "y": 1, "width": 1, "height": 2})).unwrap();
+        s.execute(ID, json!({"scale": "scale2x"})).unwrap();
+        let d = doc(&s);
+        assert_eq!(d.selection.as_ref().unwrap().content_bounds(), Rect::new(2, 2, 4, 6));
+        let m = d.layers.iter().find_map(|l| l.mask.as_ref()).unwrap();
+        for (x, y, v) in [(2, 2, 1.0), (3, 5, 1.0), (1, 3, 0.0), (4, 3, 0.0), (3, 1, 0.0)] {
+            assert_eq!(m.surface.pixel(x, y), vec![v], "({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn bad_params_and_sizes_fail_without_changing_the_document() {
+        let mut s = Session::new();
+        assert!(s.execute(ID, json!({})).is_err(), "no document");
+        let mut s = stairs(8);
+        for p in [json!([]), json!("scale2x"), json!({"scale": 2}), json!({"scale": "scale5x"}), json!({"scale": ""}), json!({"scale": null})] {
+            assert!(s.execute(ID, p.clone()).is_err(), "{p}");
+            assert_eq!(doc(&s).size, Size::new(3, 3), "{p}");
+        }
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 100_001, "height": 1})).unwrap();
+        let e = s.execute(ID, json!({"scale": "scale3x"})).unwrap_err().to_string();
+        assert!(e.contains("300000"), "{e}");
+        assert_eq!(doc(&s).size, Size::new(100_001, 1));
+    }
+
+    /// A layer parked near the edge of the coordinate range can't be scaled past it.
+    #[test]
+    fn pixels_near_the_coordinate_limit_are_refused() {
+        let mut s = stairs(8);
+        s.edit("far", |doc, _| {
+            let surf = doc.layers[0].surface_mut().unwrap();
+            surf.write_pixel(i32::MAX - 70, 0, &[1.0, 1.0, 1.0]);
+            Ok(())
+        })
+        .unwrap();
+        assert!(s.execute(ID, json!({"scale": "scale2x"})).is_err());
+        assert_eq!(doc(&s).size, Size::new(3, 3));
+    }
+}
