@@ -13,6 +13,7 @@
 
 use photocraft_algo::pixel_art::{PixelArtScale, peak_bytes, upscale_surface_in_canvas};
 use photocraft_geom::Rect;
+use photocraft_raster::Surface;
 use serde_json::{Value, json};
 
 use crate::commands::CommandSpec;
@@ -60,6 +61,21 @@ fn check_peak(scale: PixelArtScale, ow: u32, oh: u32, bytes_per_pixel: usize, ch
     Err(bad(format!("upscaling {ow} x {oh} px {n}x needs about {} MB of working memory; the limit is {} MB. Choose a smaller scale", peak >> 20, max >> 20)))
 }
 
+/// One surface's preflight: its scaled pixels stay inside the 32-bit coordinate range (the
+/// surfaces saturate there), and the working memory for the box around them fits the budget,
+/// however far past the canvas they reach.
+fn check_surface(scale: PixelArtScale, surf: &Surface) -> Result<()> {
+    let r = surf.content_bounds();
+    if r.is_empty() {
+        return Ok(());
+    }
+    let n = scale.factor();
+    if ![r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.checked_mul(n as i32).is_some()) {
+        return Err(bad(format!("upscaling {n}x would push some pixels outside the 32-bit coordinate range")));
+    }
+    check_peak(scale, r.width(), r.height(), surf.format().bytes_per_pixel(), surf.channels())
+}
+
 fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let scale = parse_scale(p)?;
     let n = scale.factor();
@@ -76,16 +92,23 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let k = f64::from(n);
     s.set_sampler_map(photocraft_geom::Affine { m: [k, 0.0, 0.0, k, 0.0, 0.0] });
     s.edit("Pixel Art Upscale", |doc, _| {
-        // Layers may reach far past the canvas; refuse before changing anything when some pixels
-        // would leave the 32-bit coordinate range (the surfaces saturate there).
-        let fits = |r: Rect| r.is_empty() || [r.x0, r.y0, r.x1, r.y1].iter().all(|v| v.checked_mul(n as i32).is_some());
-        let mut ok = true;
-        crate::image_cmds::for_each_surface(&mut doc.layers, true, &mut |surf, _| ok = ok && fits(surf.content_bounds()));
-        ok = ok
-            && doc.channels.iter().chain(doc.quick_mask.as_ref()).all(|ch| fits(ch.surface.content_bounds()))
-            && doc.selection.as_ref().is_none_or(|sel| fits(sel.content_bounds()));
-        if !ok {
-            return Err(bad(format!("upscaling {n}x would push some pixels outside the 32-bit coordinate range")));
+        // Layers, masks and channels may reach far past the canvas, and each surface upscales the
+        // box around its own pixels: check every one before changing anything.
+        let mut err = None;
+        let mut check = |surf: &Surface| {
+            if err.is_none() {
+                err = check_surface(scale, surf).err();
+            }
+        };
+        crate::image_cmds::for_each_surface(&mut doc.layers, true, &mut |surf, _| check(surf));
+        for ch in doc.channels.iter().chain(doc.quick_mask.as_ref()) {
+            check(&ch.surface);
+        }
+        if let Some(sel) = &doc.selection {
+            check(sel);
+        }
+        if let Some(e) = err {
+            return Err(e);
         }
         let canvas = Rect::from_xywh(0, 0, ow, oh);
         // Masks, channels and the selection take the same rule, so they keep fitting the pixels.
@@ -230,6 +253,22 @@ mod tests {
         // Scale2x of the same source is a quarter of the size: well within.
         assert!(check_peak(PixelArtScale::Scale2x, side, side, 16, 4).is_ok());
         assert!(check_peak(PixelArtScale::Scale4x, u32::MAX, u32::MAX, 16, 5).is_err());
+    }
+
+    /// Two pixels far apart on a small canvas: the canvas fits the budget, but the box the layer
+    /// would be upscaled over doesn't, so it is refused before anything is allocated.
+    #[test]
+    fn far_apart_layer_pixels_count_against_the_budget() {
+        let mut s = stairs(8);
+        s.edit("far", |doc, _| {
+            let surf = doc.layers[0].surface_mut().unwrap();
+            surf.write_pixel(500_000_000, 0, &[1.0, 1.0, 1.0]);
+            Ok(())
+        })
+        .unwrap();
+        let e = s.execute(ID, json!({"scale": "scale2x"})).unwrap_err().to_string();
+        assert!(e.contains("working memory"), "{e}");
+        assert_eq!(doc(&s).size, Size::new(3, 3));
     }
 
     /// A layer parked near the edge of the coordinate range can't be scaled past it.
